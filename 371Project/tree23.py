@@ -75,7 +75,7 @@ class Tree23InvertedIndex:
             if result is not None:  # Root split
                 new_root = Node23()
                 new_root.keys = [result[1]]
-                new_root.posting_lists = [[]]
+                new_root.posting_lists = [result[3]]  # Use the actual posting list
                 new_root.children = [result[0], result[2]]
                 self.root = new_root
     
@@ -120,12 +120,12 @@ class Tree23InvertedIndex:
         
         # Child split, need to insert middle value
         if not node.is_full():
-            node.insert_in_node(result[1], [])
+            node.insert_in_node(result[1], result[3])
             node.children[child_idx] = result[0]
             node.children.insert(child_idx + 1, result[2])
             return None
         else:
-            return self._split_node(node, result[1], [], result)
+            return self._split_node(node, result[1], result[3], result)
     
     def _split_node(self, node, new_key, new_posting, split_result):
         """Split a full node"""
@@ -161,7 +161,7 @@ class Tree23InvertedIndex:
             left.children = temp_children[:2]
             right.children = temp_children[2:]
         
-        return (left, temp_keys[1], right)
+        return (left, temp_keys[1], right, temp_postings[1])
     
     def wildcard_search(self, pattern):
         """Search with wildcard"""
@@ -216,8 +216,194 @@ class Tree23InvertedIndex:
                 self._collect_all_terms(child, terms)
 
 
+class PermutermIndex:
+    """Permuterm index for wildcard matching"""
+    def __init__(self):
+        self.permuterms = {}  # permuterm -> original_term
+    
+    def add_term(self, term):
+        """Add all rotations of a term to the permuterm index"""
+        # Add the term with $ marker
+        term_with_marker = term + '$'
+        
+        # Add all rotations
+        for i in range(len(term_with_marker)):
+            rotation = term_with_marker[i:] + term_with_marker[:i]
+            self.permuterms[rotation] = term
+    
+    def wildcard_search(self, pattern):
+        """Search for terms matching wildcard pattern"""
+        if '*' not in pattern:
+            return [pattern] if pattern in self.permuterms.values() else []
+        
+        # Convert pattern to permuterm query
+        if pattern.endswith('*'):
+            # Prefix query: comp* -> comp$
+            query = pattern[:-1] + '$'
+        elif pattern.startswith('*'):
+            # Suffix query: *puter -> uter$
+            query = pattern[1:] + '$'
+        else:
+            # Contains query: *put* -> put$*
+            parts = pattern.split('*')
+            if len(parts) == 2:
+                query = parts[1] + '$' + parts[0]
+            else:
+                return []
+        
+        # Find matching terms
+        matches = []
+        for permuterm, original_term in self.permuterms.items():
+            if permuterm.startswith(query):
+                if original_term not in matches:
+                    matches.append(original_term)
+        
+        # If no matches found with startswith, try alternative approach for prefix queries
+        if not matches and pattern.endswith('*'):
+            prefix = pattern[:-1]
+            for permuterm, original_term in self.permuterms.items():
+                if permuterm.startswith(prefix) and permuterm.endswith('$'):
+                    if original_term not in matches:
+                        matches.append(original_term)
+        
+        return matches
+
+
+class boolean_model:
+    """Boolean query processor with inverted index and permuterm index"""
+    
+    def __init__(self):
+        self.inverted_index = Tree23InvertedIndex()
+        self.permuterm_index = PermutermIndex()
+        self.documents = {}  # doc_id -> document text
+        self.all_doc_ids = set()
+    
+    def add_document(self, doc_id, text):
+        """Add document to both indices"""
+        self.documents[doc_id] = text
+        self.all_doc_ids.add(doc_id)
+        
+        # Add to inverted index
+        self.inverted_index.add_document(doc_id, text)
+        
+        # Add terms to permuterm index
+        tokens = self.inverted_index.tokenize(text)
+        terms = self.inverted_index.normalize(tokens)
+        for term in set(terms):  # Remove duplicates
+            self.permuterm_index.add_term(term)
+    
+    def _get_posting_list(self, term):
+        """Get posting list for a term, handling wildcards"""
+        if '*' in term:
+            # Handle wildcard
+            matching_terms = self.permuterm_index.wildcard_search(term)
+            all_docs = set()
+            for matching_term in matching_terms:
+                docs = self.inverted_index.search(matching_term)
+                all_docs.update(docs)
+            return list(all_docs)
+        else:
+            return self.inverted_index.search(term)
+    
+    def _and_operation(self, list1, list2):
+        """AND operation: intersection of two posting lists"""
+        return list(set(list1) & set(list2))
+    
+    def _or_operation(self, list1, list2):
+        """OR operation: union of two posting lists"""
+        return list(set(list1) | set(list2))
+    
+    def _not_operation(self, list1):
+        """NOT operation: all documents not in the list"""
+        return list(self.all_doc_ids - set(list1))
+    
+    def _xor_operation(self, list1, list2):
+        """XOR operation: documents in exactly one of the lists"""
+        set1, set2 = set(list1), set(list2)
+        return list((set1 - set2) | (set2 - set1))
+    
+    def _and_not_operation(self, list1, list2):
+        """AND NOT operation: documents in list1 but not in list2"""
+        return list(set(list1) - set(list2))
+    
+    def _or_not_operation(self, list1, list2):
+        """OR NOT operation: documents in list1 or not in list2"""
+        return list(set(list1) | (self.all_doc_ids - set(list2)))
+    
+    def boolean_query(self, query):
+        """
+        Process Boolean query with up to two terms and one operator
+        Supported operators: AND, OR, NOT, XOR, AND NOT, OR NOT
+        """
+        import re
+        query = query.strip()
+        
+        # Handle single term (no operator)
+        if not any(re.search(r'\b' + op.strip() + r'\b', query.upper()) for op in [' AND ', ' OR ', ' NOT ', ' XOR ', ' AND NOT ', ' OR NOT ']):
+            return self._get_posting_list(query)
+        
+        # Parse query to find operator and terms using regex
+        operators = [
+            (r'\bAND NOT\b', ' AND NOT '),
+            (r'\bOR NOT\b', ' OR NOT '),
+            (r'\bAND\b', ' AND '),
+            (r'\bOR\b', ' OR '),
+            (r'\bXOR\b', ' XOR '),
+            (r'\bNOT\b', ' NOT ')
+        ]
+        
+        for pattern, op in operators:
+            match = re.search(pattern, query.upper())
+            if match:
+                # Split the query at the operator position
+                parts = re.split(pattern, query.upper(), maxsplit=1)
+                if len(parts) == 2:
+                    # Get original case terms
+                    original_parts = re.split(pattern, query, maxsplit=1)
+                    if len(original_parts) == 2:
+                        term1 = original_parts[0].strip()
+                        term2 = original_parts[1].strip()
+                    else:
+                        term1 = parts[0].strip()
+                        term2 = parts[1].strip()
+                    
+                    # Get posting lists
+                    list1 = self._get_posting_list(term1)
+                    
+                    if op == ' NOT ':
+                        # NOT operation (unary)
+                        return self._not_operation(list1)
+                    else:
+                        # Binary operations
+                        list2 = self._get_posting_list(term2)
+                        
+                        if op == ' AND ':
+                            return self._and_operation(list1, list2)
+                        elif op == ' OR ':
+                            return self._or_operation(list1, list2)
+                        elif op == ' XOR ':
+                            return self._xor_operation(list1, list2)
+                        elif op == ' AND NOT ':
+                            return self._and_not_operation(list1, list2)
+                        elif op == ' OR NOT ':
+                            return self._or_not_operation(list1, list2)
+        
+        return []  # Invalid query format
+    
+    def display_index(self):
+        """Display the inverted index"""
+        self.inverted_index.display_index()
+    
+    def display_permuterm_index(self):
+        """Display the permuterm index"""
+        print("\n=== PERMUTERM INDEX ===")
+        for permuterm, original in sorted(self.permuterm_index.permuterms.items()):
+            print(f"{permuterm} -> {original}")
+
+
 # Main execution
 if __name__ == "__main__":
+    # Initialize the documents
     doc1 = """At very low temperatures, superconductors have zero resistance, 
               but they can also repel an external magnetic field, in such a way 
               that a spinning magnet can be held in a levitated position."""
@@ -225,14 +411,33 @@ if __name__ == "__main__":
     doc2 = """If a small magnet is brought near a superconductor, 
               it will be repelled."""
     
-    index = Tree23InvertedIndex()
-    index.add_document("Doc1", doc1)
-    index.add_document("Doc2", doc2)
+    # Create boolean model and add documents
+    bm = boolean_model()
+    bm.add_document("Doc1", doc1)
+    bm.add_document("Doc2", doc2)
     
-    index.display_index()
+    # Display indices
+    bm.display_index()
+    bm.display_permuterm_index()
     
-    print("\n=== SEARCH: s* ===")
-    results = index.wildcard_search("s*")
-    print(f"Terms found: {len(results)}")
-    for term, docs in results:
-        print(f"  {term}: {docs}")
+    # Test queries
+    print("\n=== BOOLEAN QUERY TESTS ===")
+    
+    test_queries = [
+        "superconductor",
+        "magnet",
+        "super*",
+        "superconductor AND magnet",
+        "superconductor OR magnet", 
+        "superconductor NOT magnet",
+        "superconductor XOR magnet",
+        "superconductor AND NOT magnet",
+        "superconductor OR NOT magnet",
+        "temperatures AND field",
+        "resistance OR repelled",
+        "levitated NOT small"
+    ]
+    
+    for query in test_queries:
+        result = bm.boolean_query(query)
+        print(f"Query: '{query}' -> {result}")
